@@ -296,8 +296,7 @@ export class Devour {
         f.r.x += f.vr.x * dt;
         f.r.y += f.vr.y * dt;
         f.r.z += f.vr.z * dt;
-        const onDesk = f.p.x > -1.2 && f.p.x < 0.4 && f.p.z < -1.76;
-        const floorY = onDesk ? 0.745 : 0.008;
+        const floorY = this.e.room.restY(f.p.x, f.p.z);
         if (f.p.y < floorY + 0.004) {
           f.p.y = floorY + 0.003 + i * 0.0002;
           f.rest = true;

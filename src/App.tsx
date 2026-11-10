@@ -49,14 +49,15 @@ export default function App() {
     if (!host.current) return;
     let e: Engine;
     try {
-      e = new Engine(host.current, setUi);
+      e = new Engine(host.current, setUi, () =>
+        setError('部屋のデータを読み込めませんでした。通信状況を確認して、ページを再読み込みしてください。')
+      );
     } catch (err) {
       console.error(err);
       setError('WebGL を初期化できませんでした。ハードウェアアクセラレーションが有効なブラウザでお試しください。');
       return;
     }
     engine.current = e;
-    setUi((s) => ({ ...s, ready: true }));
     return () => {
       e.dispose();
       engine.current = null;

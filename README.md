@@ -47,7 +47,8 @@ src/
   index.css           Tailwind CSS v4 + 少量の独自スタイル
   game/
     Engine.ts         進行管理（title → room → monitor → devour → world → collapse → after）、入力、メインループ
-    room.ts           自室（机・モニター・小物・照明）
+    room.ts           自室（机・モニター・小物・照明・時計・残骸）と Portal シェーダ。glTF で読み込んだ寝室の箱と小物を束ねる
+    bedroom.ts        寝室シーン（壁・床・天井・窓・ベッド・机・PC・椅子・ランプ・外の雨・ひび・塵）の構築と、それ用のマテリアル
     bsodScreen.ts     モニターに映る画面（デスクトップ → フリーズ → ブルースクリーン）
     devour.ts         画面に呑まれる演出
     world.ts          ブルースクリーンの内側の世界
@@ -58,7 +59,20 @@ src/
     utils.ts          数学ユーティリティ（ノイズ・補間・バネ等）
 public/
   favicon.svg, og.jpg
+  models/           寝室・ゲーミングPC・椅子・ケーブルの glTF（CC-BY、下記クレジット参照）
+  textures/         壁紙・床・ラグの法線/拡散、置時計・ランプ、およびベッド上の絵（パブリックドメイン）
 ```
+
+## クレジット
+
+寝室を形作る 3D モデルは Sketchfab で公開されている作者の方々の CC-BY 4.0 作品をお借りしています（改変・再配布）。ライセンスに従い作者名とリンクを明記します。
+
+- **Modern Stylized Bedroom** — Visthétique, https://sketchfab.com/3d-models/modern-stylized-bedroom-b74c53589e334ba1ba4b43883d7c9e21
+- **Gaming Desktop PC** — Yolala1232, https://sketchfab.com/3d-models/gaming-desktop-pc-d1d8282c9916438091f11aeb28787b66
+- **Office Chair** — crow (crow.bite), https://sketchfab.com/3d-models/office-chair-5cd859cd7b9a430db0195af2ba89949b
+- **Modular cables 1m** — Sim387 (350rdlc.sl), https://sketchfab.com/3d-models/modular-cables-1m-86fd2a4c57144bf083882564a63870f7
+
+壁・床・ラグの表面テクスチャ、およびベッド上の絵（Henry Fuseli 『夢魔』1781）はパブリックドメインの素材を元にしています。
 
 ## 技術
 

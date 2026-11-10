@@ -1,17 +1,7 @@
 import * as THREE from 'three';
-import {
-  calendarTexture,
-  cityTexture,
-  clockTexture,
-  keyboardTexture,
-  noteTexture,
-  posterTexture,
-  rainTexture,
-  rugTexture,
-  wallTexture,
-  woodTexture,
-} from './textures';
-import { TAU, clamp, fnoise, mulberry } from './utils';
+import { Bedroom, type BedroomCtx, type PatchOpts, loadBedroomAssets, roomToWorld, sharedNoiseTexture } from './bedroom';
+import { clockTexture } from './textures';
+import { TAU, clamp, fnoise } from './utils';
 const FX_DECL = /* glsl */ `
 uniform vec3 uPortal;
 uniform float uSuck;
@@ -20,10 +10,20 @@ uniform float uTear;
 uniform float uMawR;
 uniform float uRfxTime;
 uniform vec3 uRfxBlue;
+uniform float uRfxRimGain;
 varying vec3 vRfxW;
 varying float vRfxPull;
 float rfxHash(vec3 p) { return fract(sin(dot(p, vec3(127.1, 311.7, 74.7))) * 43758.5453); }
 float rfxHash2(vec2 p) { return fract(sin(dot(p, vec2(127.1, 311.7))) * 43758.5453); }
+#ifdef RFX_CRAFT
+uniform sampler2D uRfxNoise;
+varying float vRfxWall;
+#endif
+#ifdef RFX_RIM
+uniform vec3 uRfxRimCol;
+uniform vec3 uRfxRimPar;
+varying vec3 vRfxRim;
+#endif
 `;
 // world-space vertex stage: the room is dragged, twisted and swallowed by the portal
 const FX_VERT = /* glsl */ `
@@ -50,6 +50,20 @@ if (uSuck > 0.0005) {
 }
 mvPosition = viewMatrix * rfxW;
 gl_Position = projectionMatrix * mvPosition;
+#ifdef RFX_CRAFT
+vRfxWall = 1.0 - smoothstep(0.32, 0.72, abs(normalize(mat3(modelMatrix) * objectNormal).y));
+#endif
+#ifdef RFX_RIM
+{
+  // fresnel rim + a soft sheen, per vertex: props keep some shape in a room this dark
+  vec3 rfxV = normalize(-mvPosition.xyz);
+  vec3 rfxN = normalize(transformedNormal);
+  float rfxF = 1.0 - clamp(abs(dot(rfxN, rfxV)), 0.0, 1.0);
+  rfxF = rfxF * rfxF * rfxF;
+  float rfxSp = pow(max(dot(rfxN, normalize(normalize(vec3(-0.35, 0.65, 0.67)) + rfxV)), 0.0), uRfxRimPar.y) * uRfxRimPar.x;
+  vRfxRim = uRfxRimCol * (rfxF * uRfxRimPar.z + rfxSp * 0.65) + vec3(rfxSp * 0.35);
+}
+#endif
 `;
 const FX_FRAG_HEAD = /* glsl */ `
   if (uMawR > 0.0) {
@@ -61,8 +75,25 @@ const FX_FRAG_HEAD = /* glsl */ `
     if (rfxCell < uTear * 1.25 - distance(vRfxW, uPortal) * 0.1) discard;
   }
 `;
+/** end of the fragment stage for anything the portal can drag in */
+const FX_FRAG_PULL = /* glsl */ `
+gl_FragColor.rgb = mix(gl_FragColor.rgb, vec3(0.7, 0.86, 1.0) * 2.2, smoothstep(0.3, 0.9, vRfxPull));
+`;
 const FX_FRAG_TAIL = /* glsl */ `
 #include <dithering_fragment>
+#ifdef RFX_CRAFT
+{
+  // plaster / board craft: grain, faint wallpaper seams, darkening into floor and cornice
+  float rfxAxis = vRfxW.x + vRfxW.z;
+  vec4 rfxNC = texture2D(uRfxNoise, vec2(rfxAxis * 0.28, vRfxW.y * 0.28));
+  float rfxStripe = smoothstep(0.40, 0.50, abs(fract(rfxAxis * 1.92) - 0.5)) * vRfxWall;
+  float rfxAO = (smoothstep(0.52, 0.0, vRfxW.y) * 0.40 + smoothstep(2.58, 3.15, vRfxW.y) * 0.32) * vRfxWall;
+  gl_FragColor.rgb *= (1.0 - (rfxNC.g - 0.5) * 0.07 + (rfxNC.r - 0.5) * 0.11 + rfxStripe * 0.055) * (1.0 - rfxAO);
+}
+#endif
+#ifdef RFX_RIM
+gl_FragColor.rgb += vRfxRim * uRfxRimGain;
+#endif
 #ifndef RFX_NO_INFECT
 {
   float rfxD = distance(vRfxW, uPortal);
@@ -92,7 +123,22 @@ interface Collider {
   z1: number;
   on: boolean;
 }
-export const ROOM = { hw: 2.2, hd: 2.5, h: 2.5 };
+/** half extents of the shell around the origin (used for the debris torn off the walls) */
+export const ROOM = { hw: 2.25, hd: 2.37, h: 3.15 };
+/** where feet can go */
+const WALK = { x0: -2.55, x1: 2.45, z0: -2.9, z1: 1.27 };
+const DESK_TOP = 0.762;
+const FLOOR = 0.017;
+// office chair, in the bedroom's own space
+const CHAIR_REST = { pos: [-0.82, FLOOR, 1.3], rot: [0, -2.25, 0] };
+const CHAIR_FALLEN = { pos: [-0.78, 0.285, 1.18], rot: [0, 1.15, 0.55] };
+const CHAIR_BOX = { x0: 0.84, x1: 1.39, z0: -1.63, z1: -1.13 };
+const CHAIR_BOX_FALLEN = { x0: 0.75, x1: 1.65, z0: -1.7, z1: -0.3 };
+/**
+ * The bedroom. The place itself comes from bsod_ex (see bedroom.ts); this class owns what the
+ * rest of the game talks to: the portal shader, the screen, the lights, the clock, collisions
+ * and the handful of things that are different after you come back.
+ */
 export class Room {
   group = new THREE.Group();
   fx = {
@@ -103,374 +149,173 @@ export class Room {
     uMawR: { value: 0 },
     uRfxTime: { value: 0 },
     uRfxBlue: { value: new THREE.Color('#0078d7') },
+    uRfxNoise: { value: sharedNoiseTexture() as THREE.Texture },
+    uRfxRimGain: { value: 1 },
   };
   screenMesh!: THREE.Mesh;
-  screenCenter = new THREE.Vector3(-0.4, 1.08, -2.262);
-  screenW = 0.61;
-  screenH = 0.343;
-  focusPos = new THREE.Vector3(-0.4, 1.1, -1.66);
-  startPos = new THREE.Vector3(0.55, 1.62, 1.55);
-  landPos = new THREE.Vector3(-0.3, 0, -0.75);
+  /** BSOD_SCREEN_NODE of the PC model, in world space */
+  screenCenter = new THREE.Vector3(-1.335, 1.045, -2.053);
+  screenW = 0.6636;
+  screenH = 0.3655;
+  focusPos = new THREE.Vector3(-1.335, 1.065, -1.42);
+  startPos = new THREE.Vector3(-1.38, 1.62, -0.55);
+  startYaw = 0.06;
+  startPitch = -0.06;
+  landPos = new THREE.Vector3(-0.78, 0, -1.05);
+  /** things the ear can place (x, z) */
+  fanPos = new THREE.Vector2(-0.48, -2.03);
+  clockPos = new THREE.Vector2(-0.40, -2.35);
   hemi!: THREE.HemisphereLight;
   monitorLight!: THREE.SpotLight;
   monitorFill!: THREE.PointLight;
   lamp!: THREE.SpotLight;
   lampGlow!: THREE.PointLight;
   moon!: THREE.SpotLight;
-  ceiling!: THREE.Mesh;
   lampOn = 1;
   screenGain = 1;
   aftermath = false;
+  loaded = false;
   clockTime = 2 * 3600 + 47 * 60 + 12;
-  private lampBulb!: THREE.MeshBasicMaterial;
+  private amb = {
+    uTime: this.fx.uRfxTime,
+    uInfect: { value: 0 },
+    uPortalPos: this.fx.uPortal,
+    uCamForward: { value: new THREE.Vector3(0, 0, -1) },
+    uNoiseTex: this.fx.uRfxNoise,
+    uAfter: { value: 0 },
+  };
+  private ctx: BedroomCtx = {
+    patch: (mat, opts) => this.patch(mat, opts),
+    fxShader: (params) => this.fxShader(params),
+    amb: this.amb,
+  };
+  private bed: Bedroom | null = null;
   private screenMat!: THREE.MeshBasicMaterial;
-  private chair = new THREE.Group();
+  private beamMat!: THREE.ShaderMaterial;
+  private beam!: THREE.Mesh;
   private shard = new THREE.Group();
   private shardLight!: THREE.PointLight;
-  private poster!: THREE.Mesh;
-  private posterA!: THREE.Texture;
-  private posterB!: THREE.Texture;
   private hands: THREE.Object3D[] = [];
-  private pcLed!: THREE.MeshBasicMaterial;
-  private rainTex!: THREE.Texture;
-  private windowMat!: THREE.MeshBasicMaterial;
   private colliders: Collider[] = [];
   private chairCollider!: Collider;
   private lastSecond = -1;
-  private ceilingParts: THREE.Object3D[] = [];
+  private lastMinute = -1;
+  private ceilingOn = true;
   constructor(screenTexture: THREE.Texture) {
     this.fx.uPortal.value.copy(this.screenCenter);
     this.build(screenTexture);
   }
-  patch<T extends THREE.Material>(mat: T, noInfect = false): T {
+  /** fetches the models and textures and puts the room together around the screen */
+  async load(): Promise<void> {
+    const assets = await loadBedroomAssets();
+    this.bed = new Bedroom(this.ctx, assets);
+    this.group.add(this.bed.inner);
+    this.loaded = true;
+    this.setAftermath(this.aftermath);
+    this.setCeiling(this.ceilingOn);
+    this.lastMinute = -1;
+  }
+  /** makes a built-in material obey the portal: dragged, twisted, torn, overwritten in blue */
+  patch<T extends THREE.Material>(mat: T, opt: PatchOpts | boolean = false): T {
+    const o: PatchOpts = typeof opt === 'boolean' ? { noInfect: opt } : opt;
+    const defs = (o.noInfect ? '#define RFX_NO_INFECT\n' : '') + (o.craft ? '#define RFX_CRAFT\n' : '') + (o.rim ? '#define RFX_RIM\n' : '');
     mat.onBeforeCompile = (shader) => {
       Object.assign(shader.uniforms, this.fx);
-      shader.vertexShader = FX_DECL + shader.vertexShader.replace('#include <project_vertex>', FX_VERT);
+      if (o.rim) {
+        shader.uniforms.uRfxRimCol = { value: o.rim.color };
+        shader.uniforms.uRfxRimPar = { value: o.rim.params };
+      }
+      shader.vertexShader = defs + FX_DECL + shader.vertexShader.replace('#include <project_vertex>', FX_VERT);
       shader.fragmentShader =
-        (noInfect ? '#define RFX_NO_INFECT\n' : '') +
+        defs +
         FX_DECL +
         shader.fragmentShader
           .replace('void main() {', 'void main() {\n' + FX_FRAG_HEAD)
           .replace('#include <dithering_fragment>', FX_FRAG_TAIL);
     };
-    mat.customProgramCacheKey = () => (noInfect ? 'rfx-ni' : 'rfx');
+    mat.customProgramCacheKey = () => 'rfx' + (o.noInfect ? '-ni' : '') + (o.craft ? '-c' : '') + (o.rim ? '-r' : '');
     return mat;
+  }
+  /**
+   * The same for hand-written shaders. The vertex stage must declare `vec3 transformed` and
+   * contain the marker RFX_PROJECT where it would set gl_Position; the fragment stage may end
+   * with the marker RFX_TAIL.
+   */
+  fxShader(params: THREE.ShaderMaterialParameters): THREE.ShaderMaterial {
+    return new THREE.ShaderMaterial({
+      ...params,
+      uniforms: { ...params.uniforms, ...this.fx },
+      vertexShader: FX_DECL + (params.vertexShader ?? '').replace('/*RFX_PROJECT*/', FX_VERT),
+      fragmentShader:
+        FX_DECL +
+        (params.fragmentShader ?? '').replace('void main() {', 'void main() {\n' + FX_FRAG_HEAD).replace('/*RFX_TAIL*/', FX_FRAG_PULL),
+    });
   }
   private build(screenTexture: THREE.Texture) {
     const G = this.group;
-    const rnd = mulberry(2024);
-    const cache = new Map<string, THREE.MeshStandardMaterial>();
-    const std = (color: string, rough = 0.85, metal = 0) => {
-      const key = `${color}|${rough}|${metal}`;
-      let m = cache.get(key);
-      if (!m) {
-        m = this.patch(new THREE.MeshStandardMaterial({ color, roughness: rough, metalness: metal }));
-        cache.set(key, m);
-      }
-      return m;
-    };
+    const std = (color: string, rough = 0.85, metal = 0) => this.patch(new THREE.MeshStandardMaterial({ color, roughness: rough, metalness: metal }));
     const basic = (params: THREE.MeshBasicMaterialParameters) => this.patch(new THREE.MeshBasicMaterial(params));
-    const box = (
-      w: number,
-      h: number,
-      d: number,
-      mat: THREE.Material,
-      x: number,
-      y: number,
-      z: number,
-      parent: THREE.Object3D = G,
-      cast = true
-    ) => {
-      const m = new THREE.Mesh(new THREE.BoxGeometry(w, h, d), mat);
-      m.position.set(x, y, z);
-      m.castShadow = cast;
-      m.receiveShadow = true;
-      parent.add(m);
-      return m;
-    };
-    const cyl = (
-      rt: number,
-      rb: number,
-      h: number,
-      mat: THREE.Material,
-      x: number,
-      y: number,
-      z: number,
-      parent: THREE.Object3D = G,
-      open = false
-    ) => {
-      const m = new THREE.Mesh(new THREE.CylinderGeometry(rt, rb, h, 18, 1, open), mat);
-      m.position.set(x, y, z);
-      m.castShadow = true;
-      m.receiveShadow = true;
-      parent.add(m);
-      return m;
-    };
-    const plane = (w: number, h: number, mat: THREE.Material, x: number, y: number, z: number, ry = 0, sx = 1, sy = 1) => {
-      const m = new THREE.Mesh(new THREE.PlaneGeometry(w, h, sx, sy), mat);
-      m.position.set(x, y, z);
-      m.rotation.y = ry;
-      m.receiveShadow = true;
-      G.add(m);
-      return m;
-    };
-    const { hw, hd, h: RH } = ROOM;
-    // ---------- shell ----------
-    const wallTex = wallTexture();
-    const wallMat = this.patch(new THREE.MeshStandardMaterial({ map: wallTex, color: '#a7a299', roughness: 0.95 }));
-    wallTex.repeat.set(3, 2);
-    plane(hw * 2, RH, wallMat, 0, RH / 2, -hd, 0, 26, 14);
-    plane(hw * 2, RH, wallMat, 0, RH / 2, hd, Math.PI, 26, 14);
-    plane(hd * 2, RH, wallMat, -hw, RH / 2, 0, Math.PI / 2, 28, 14);
-    plane(hd * 2, RH, wallMat, hw, RH / 2, 0, -Math.PI / 2, 28, 14);
-    const woodTex = woodTexture();
-    woodTex.repeat.set(2.4, 2.8);
-    const floor = new THREE.Mesh(
-      new THREE.PlaneGeometry(hw * 2, hd * 2, 26, 28),
-      this.patch(new THREE.MeshStandardMaterial({ map: woodTex, roughness: 0.62, color: '#c9b8a6' }))
-    );
-    floor.rotation.x = -Math.PI / 2;
-    floor.receiveShadow = true;
-    G.add(floor);
-    this.ceiling = new THREE.Mesh(new THREE.PlaneGeometry(hw * 2, hd * 2, 22, 24), std('#8f8c86', 1));
-    this.ceiling.rotation.x = Math.PI / 2;
-    this.ceiling.position.y = RH;
-    G.add(this.ceiling);
-    this.ceilingParts.push(this.ceiling);
-    const baseMat = std('#2a2622', 0.7);
-    box(hw * 2, 0.07, 0.015, baseMat, 0, 0.035, -hd + 0.008, G, false);
-    box(hw * 2, 0.07, 0.015, baseMat, 0, 0.035, hd - 0.008, G, false);
-    box(0.015, 0.07, hd * 2, baseMat, -hw + 0.008, 0.035, 0, G, false);
-    box(0.015, 0.07, hd * 2, baseMat, hw - 0.008, 0.035, 0, G, false);
-    this.ceilingParts.push(cyl(0.24, 0.26, 0.05, std('#b9b6ae', 0.6), 0, RH - 0.03, 0.2));
-    // ---------- desk ----------
-    const deskMat = std('#3a2a1f', 0.6);
     const sx = this.screenCenter.x;
     const sy = this.screenCenter.y;
     const sz = this.screenCenter.z;
-    box(1.6, 0.04, 0.72, deskMat, -0.4, 0.72, -2.12);
-    box(0.04, 0.7, 0.68, deskMat, -1.18, 0.35, -2.12);
-    box(0.04, 0.7, 0.68, deskMat, 0.38, 0.35, -2.12);
-    box(1.52, 0.3, 0.02, deskMat, -0.4, 0.52, -2.44);
-    box(0.4, 0.5, 0.6, std('#30241b', 0.6), 0.16, 0.44, -2.12);
-    box(0.14, 0.012, 0.012, std('#888', 0.3, 0.8), 0.16, 0.56, -1.815, G, false);
-    box(0.14, 0.012, 0.012, std('#888', 0.3, 0.8), 0.16, 0.36, -1.815, G, false);
-    // ---------- monitor ----------
-    const plastic = std('#0d0d10', 0.45);
-    box(0.64, 0.375, 0.028, plastic, sx, sy, sz - 0.016);
-    box(0.05, 0.3, 0.04, plastic, sx, 0.9, sz - 0.05);
-    box(0.24, 0.012, 0.18, plastic, sx, 0.746, sz - 0.04);
+    // ---------- the screen (this game's own picture, in the frame of the PC model's monitor) ----------
     this.screenMat = this.patch(new THREE.MeshBasicMaterial({ map: screenTexture, toneMapped: false }), true);
     this.screenMesh = new THREE.Mesh(new THREE.PlaneGeometry(this.screenW, this.screenH, 20, 12), this.screenMat);
     this.screenMesh.position.copy(this.screenCenter);
+    // the monitor leans back four degrees
+    this.screenMesh.rotation.x = -0.0698;
     G.add(this.screenMesh);
-    const note1 = new THREE.Mesh(
-      new THREE.PlaneGeometry(0.075, 0.075),
-      this.patch(new THREE.MeshStandardMaterial({ map: noteTexture(['〆切', '朝 9:00']), roughness: 0.9 }))
-    );
-    note1.position.set(sx + 0.345, sy + 0.1, sz - 0.001);
-    note1.rotation.z = -0.08;
-    G.add(note1);
-    const note2 = new THREE.Mesh(
-      new THREE.PlaneGeometry(0.07, 0.07),
-      this.patch(new THREE.MeshStandardMaterial({ map: noteTexture(['寝るな'], '#f0a6b4'), roughness: 0.9 }))
-    );
-    note2.position.set(sx + 0.35, sy - 0.02, sz - 0.0005);
-    note2.rotation.z = 0.1;
-    G.add(note2);
-    // ---------- desk clutter ----------
-    box(0.43, 0.02, 0.145, plastic, sx, 0.75, -1.95);
-    const keys = new THREE.Mesh(
-      new THREE.PlaneGeometry(0.42, 0.138),
-      this.patch(new THREE.MeshStandardMaterial({ map: keyboardTexture(), roughness: 0.5, emissive: '#223', emissiveIntensity: 0.4 }))
-    );
-    keys.rotation.x = -Math.PI / 2;
-    keys.position.set(sx, 0.7606, -1.95);
-    G.add(keys);
-    box(0.27, 0.004, 0.23, std('#15161a', 0.9), 0.02, 0.742, -1.94, G, false);
-    const mouse = new THREE.Mesh(new THREE.SphereGeometry(0.05, 14, 10), plastic);
-    mouse.scale.set(0.62, 0.36, 1);
-    mouse.position.set(0.02, 0.758, -1.94);
-    mouse.castShadow = true;
-    G.add(mouse);
-    // mug
-    cyl(0.042, 0.037, 0.09, std('#c8c2b5', 0.4), -1.0, 0.785, -1.96);
-    const handle = new THREE.Mesh(new THREE.TorusGeometry(0.026, 0.007, 8, 14), std('#c8c2b5', 0.4));
-    handle.position.set(-1.045, 0.787, -1.96);
-    G.add(handle);
-    cyl(0.038, 0.038, 0.004, std('#1b0f08', 0.3), -1.0, 0.822, -1.96);
-    // energy drinks
-    cyl(0.027, 0.027, 0.125, std('#1f6b3a', 0.3, 0.7), 0.26, 0.802, -2.32);
-    cyl(0.027, 0.027, 0.125, std('#1f6b3a', 0.3, 0.7), 0.19, 0.802, -2.36);
-    const can = cyl(0.027, 0.027, 0.125, std('#1f6b3a', 0.3, 0.7), -0.72, 0.767, -1.84);
-    can.rotation.set(Math.PI / 2, 0, 0.6);
-    // cup noodle
-    cyl(0.052, 0.036, 0.1, std('#d8d3c6', 0.8), -0.78, 0.79, -2.32);
-    cyl(0.0525, 0.045, 0.035, std('#a8322a', 0.8), -0.78, 0.8, -2.32);
-    const stick = box(0.005, 0.005, 0.23, std('#b38a57', 0.8), -0.775, 0.846, -2.3, G, false);
-    stick.rotation.y = 0.5;
-    const stick2 = box(0.005, 0.005, 0.23, std('#b38a57', 0.8), -0.785, 0.846, -2.31, G, false);
-    stick2.rotation.y = 0.62;
-    // books + papers
-    const bookCols = ['#6b2f2a', '#28405e', '#4b5a33', '#73603a', '#3b3550', '#7a3f55', '#2d4f4f'];
-    for (let i = 0; i < 4; i++) {
-      const b = box(0.2 + rnd() * 0.04, 0.022 + rnd() * 0.02, 0.27, std(bookCols[i], 0.8), 0.2, 0.752 + i * 0.03, -2.16);
-      b.rotation.y = (rnd() - 0.5) * 0.4;
-    }
-    for (let i = 0; i < 5; i++) {
-      const p = box(0.21, 0.0015, 0.297, std('#d9d5ca', 0.9), -0.82 + rnd() * 0.06, 0.742 + i * 0.002, -2.0, G, false);
-      p.rotation.y = (rnd() - 0.5) * 0.5;
-    }
-    const phone = box(0.07, 0.008, 0.145, plastic, 0.27, 0.746, -1.84, G, false);
-    phone.rotation.y = 0.35;
-    box(0.23, 0.07, 0.12, std('#5a84a8', 0.8), -0.42, 0.775, -2.4);
-    box(0.09, 0.02, 0.05, std('#e8e8e8', 0.9), -0.42, 0.815, -2.4, G, false);
-    // desk lamp
-    cyl(0.07, 0.08, 0.02, std('#20302a', 0.4, 0.5), -1.05, 0.75, -2.33);
-    const arm = box(0.014, 0.42, 0.014, std('#20302a', 0.4, 0.5), -1.03, 0.95, -2.31);
-    arm.rotation.z = -0.1;
-    const arm2 = box(0.014, 0.26, 0.014, std('#20302a', 0.4, 0.5), -0.95, 1.2, -2.26);
-    arm2.rotation.set(0.5, 0, -1.0);
-    const shade = new THREE.Mesh(
-      new THREE.ConeGeometry(0.085, 0.12, 18, 1, true),
-      this.patch(new THREE.MeshStandardMaterial({ color: '#20302a', roughness: 0.4, metalness: 0.5, side: THREE.DoubleSide }))
-    );
-    shade.position.set(-0.86, 1.2, -2.2);
-    shade.rotation.set(0.25, 0, -0.25);
-    G.add(shade);
-    this.lampBulb = basic({ color: new THREE.Color(3.2, 2.1, 1.1) });
-    const bulb = new THREE.Mesh(new THREE.SphereGeometry(0.024, 10, 8), this.lampBulb);
-    bulb.position.set(-0.855, 1.175, -2.195);
-    G.add(bulb);
-    // ---------- PC tower ----------
-    box(0.2, 0.44, 0.46, std('#101114', 0.5, 0.3), -0.95, 0.22, -2.1);
-    this.pcLed = basic({ color: new THREE.Color(0.2, 1.6, 2.4) });
-    const led = new THREE.Mesh(new THREE.BoxGeometry(0.012, 0.3, 0.004), this.pcLed);
-    led.position.set(-0.89, 0.24, -1.868);
-    G.add(led);
-    const led2 = new THREE.Mesh(new THREE.BoxGeometry(0.014, 0.014, 0.004), basic({ color: new THREE.Color(0.3, 2.2, 0.6) }));
-    led2.position.set(-1.0, 0.4, -1.868);
-    G.add(led2);
-    box(0.3, 0.03, 0.06, std('#d6d2c8', 0.7), -1.55, 0.015, -2.32, G, false);
-    const sw = new THREE.Mesh(new THREE.BoxGeometry(0.02, 0.008, 0.02), basic({ color: new THREE.Color(2.4, 0.3, 0.15) }));
-    sw.position.set(-1.67, 0.034, -2.32);
-    G.add(sw);
-    // ---------- chair ----------
-    const fabric = std('#1a1c22', 0.9);
-    const C = this.chair;
-    box(0.46, 0.07, 0.46, fabric, 0, 0.46, 0, C);
-    box(0.44, 0.62, 0.06, fabric, 0, 0.84, 0.24, C);
-    box(0.05, 0.03, 0.3, plastic, -0.25, 0.62, 0.02, C);
-    box(0.05, 0.03, 0.3, plastic, 0.25, 0.62, 0.02, C);
-    cyl(0.028, 0.028, 0.36, std('#555', 0.3, 0.8), 0, 0.25, 0, C);
-    for (let i = 0; i < 5; i++) {
-      const a = (i / 5) * TAU;
-      const leg = box(0.3, 0.028, 0.04, plastic, Math.cos(a) * 0.15, 0.06, Math.sin(a) * 0.15, C);
-      leg.rotation.y = -a;
-      const wheel = new THREE.Mesh(new THREE.SphereGeometry(0.028, 8, 6), plastic);
-      wheel.position.set(Math.cos(a) * 0.29, 0.028, Math.sin(a) * 0.29);
-      C.add(wheel);
-    }
-    C.position.set(-0.36, 0, -1.3);
-    C.rotation.y = 0.32;
-    G.add(C);
-    // ---------- bed ----------
-    box(1.05, 0.26, 2.05, std('#3b2d22', 0.7), 1.66, 0.13, 0.85);
-    box(1.0, 0.16, 2.0, std('#bdb8ae', 0.95), 1.66, 0.34, 0.85);
-    box(1.04, 0.06, 1.25, std('#27324d', 0.95), 1.66, 0.45, 0.42);
-    const fold = box(0.75, 0.1, 0.5, std('#27324d', 0.95), 1.5, 0.5, 1.0);
-    fold.rotation.set(0.08, 0.5, -0.06);
-    const fold2 = box(0.5, 0.08, 0.42, std('#2d3a58', 0.95), 1.82, 0.5, 0.75);
-    fold2.rotation.set(-0.06, -0.3, 0.1);
-    const pillow = new THREE.Mesh(new THREE.SphereGeometry(1, 16, 10), std('#cfcbc2', 0.95));
-    pillow.scale.set(0.33, 0.09, 0.2);
-    pillow.position.set(1.66, 0.47, 1.62);
-    pillow.rotation.y = 0.15;
-    pillow.castShadow = true;
-    G.add(pillow);
-    box(1.05, 0.55, 0.05, std('#3b2d22', 0.7), 1.66, 0.42, 1.9);
-    // ---------- shelf ----------
-    const shelfMat = std('#4a382a', 0.7);
-    box(0.32, 1.8, 0.03, shelfMat, -2.03, 0.9, 0.55);
-    box(0.32, 1.8, 0.03, shelfMat, -2.03, 0.9, 1.6);
-    box(0.02, 1.8, 1.05, shelfMat, -2.18, 0.9, 1.075);
-    for (let s = 0; s < 5; s++) {
-      const y = 0.02 + s * 0.445;
-      box(0.32, 0.025, 1.05, shelfMat, -2.03, y, 1.075);
-      if (s === 4) break;
-      let z = 0.6;
-      while (z < 1.5) {
-        const t = 0.02 + rnd() * 0.035;
-        if (rnd() > 0.14) {
-          const hgt = 0.2 + rnd() * 0.14;
-          const b = box(0.17 + rnd() * 0.06, hgt, t, std(bookCols[Math.floor(rnd() * bookCols.length)], 0.85), -2.02, y + 0.0125 + hgt / 2, z + t / 2, G, false);
-          if (rnd() > 0.88) b.rotation.x = 0.22;
-        } else z += 0.06;
-        z += t + 0.003;
-      }
-    }
-    cyl(0.06, 0.045, 0.09, std('#8a5a3c', 0.9), -2.02, 1.86, 0.75);
-    const plant = new THREE.Mesh(new THREE.IcosahedronGeometry(0.1, 0), std('#2f4a2c', 0.9));
-    plant.position.set(-2.02, 1.98, 0.75);
-    plant.scale.set(1, 1.3, 1);
-    G.add(plant);
-    box(0.12, 0.16, 0.1, std('#c9c4b8', 0.6), -2.02, 1.89, 1.2);
-    box(0.2, 0.05, 0.28, std('#17181c', 0.5), -2.02, 1.84, 1.42);
-    // ---------- window ----------
-    this.windowMat = basic({ map: cityTexture(), color: new THREE.Color(0.7, 0.75, 0.9) });
-    plane(1.1, 1.0, this.windowMat, -hw + 0.012, 1.45, -0.9, Math.PI / 2, 6, 6);
-    this.rainTex = rainTexture();
-    this.rainTex.repeat.set(3, 1.5);
-    plane(1.1, 1.0, basic({ map: this.rainTex, transparent: true, opacity: 0.6, depthWrite: false }), -hw + 0.018, 1.45, -0.9, Math.PI / 2);
-    const frame = std('#cfcabf', 0.6);
-    box(0.05, 0.05, 1.2, frame, -hw + 0.03, 1.97, -0.9, G, false);
-    box(0.07, 0.04, 1.24, frame, -hw + 0.04, 0.94, -0.9, G, false);
-    box(0.05, 1.0, 0.05, frame, -hw + 0.03, 1.45, -1.475, G, false);
-    box(0.05, 1.0, 0.05, frame, -hw + 0.03, 1.45, -0.325, G, false);
-    box(0.03, 1.0, 0.03, frame, -hw + 0.03, 1.45, -0.9, G, false);
-    const curtainMat = this.patch(new THREE.MeshStandardMaterial({ color: '#3d3a4c', roughness: 1, side: THREE.DoubleSide }));
-    for (const [z0, w] of [
-      [-1.6, 0.42],
-      [-0.3, 0.3],
-    ]) {
-      const cg = new THREE.PlaneGeometry(w, 1.45, 14, 1);
-      const pos = cg.attributes.position;
-      for (let i = 0; i < pos.count; i++) pos.setZ(i, Math.sin(pos.getX(i) * 46) * 0.022);
-      cg.computeVertexNormals();
-      const cm = new THREE.Mesh(cg, curtainMat);
-      cm.position.set(-hw + 0.1, 1.33, z0 + w / 2);
-      cm.rotation.y = Math.PI / 2;
-      cm.castShadow = true;
-      G.add(cm);
-    }
-    const rod = cyl(0.012, 0.012, 1.5, std('#777', 0.3, 0.8), -hw + 0.1, 2.07, -0.9);
-    rod.rotation.x = Math.PI / 2;
-    box(0.24, 0.27, 0.8, std('#c9c6be', 0.6), -hw + 0.12, 2.3, 0.3);
-    const acLed = new THREE.Mesh(new THREE.BoxGeometry(0.004, 0.012, 0.012), basic({ color: new THREE.Color(0.3, 2.0, 0.5) }));
-    acLed.position.set(-hw + 0.243, 2.2, 0.62);
-    G.add(acLed);
-    // ---------- door ----------
-    box(0.86, 2.02, 0.05, std('#5a4433', 0.7), -1.2, 1.01, hd - 0.03);
-    box(0.06, 2.1, 0.07, std('#3a2c22', 0.7), -1.66, 1.05, hd - 0.035, G, false);
-    box(0.06, 2.1, 0.07, std('#3a2c22', 0.7), -0.74, 1.05, hd - 0.035, G, false);
-    box(0.98, 0.06, 0.07, std('#3a2c22', 0.7), -1.2, 2.08, hd - 0.035, G, false);
-    const knob = new THREE.Mesh(new THREE.SphereGeometry(0.032, 10, 8), std('#9a8a60', 0.3, 0.9));
-    knob.position.set(-0.9, 1.0, hd - 0.08);
-    G.add(knob);
-    box(0.5, 0.75, 0.06, std('#22242c', 0.95), -1.2, 1.5, hd - 0.09);
-    // ---------- walls ----------
-    this.posterA = posterTexture(0);
-    this.posterB = posterTexture(2);
-    this.poster = plane(0.52, 0.73, this.patch(new THREE.MeshStandardMaterial({ map: this.posterA, roughness: 0.8 })), 0.82, 1.55, -hd + 0.006);
-    plane(0.5, 0.7, this.patch(new THREE.MeshStandardMaterial({ map: posterTexture(1), roughness: 0.8 })), hw - 0.006, 1.6, 0.95, -Math.PI / 2);
-    plane(0.34, 0.34, this.patch(new THREE.MeshStandardMaterial({ map: calendarTexture(), roughness: 0.9 })), hw - 0.006, 1.5, -1.3, -Math.PI / 2);
-    // clock
+    // its glow hanging in the air in front of it
+    const beamLen = 1.95;
+    const beamGeo = new THREE.CylinderGeometry(0.24, 0.8, beamLen, 20, 1, true);
+    beamGeo.rotateX(Math.PI * 0.5);
+    beamGeo.translate(0, -0.04, beamLen * 0.5 + 0.02);
+    this.beamMat = new THREE.ShaderMaterial({
+      transparent: true,
+      depthWrite: false,
+      side: THREE.DoubleSide,
+      blending: THREE.AdditiveBlending,
+      uniforms: {
+        uTime: this.fx.uRfxTime,
+        uIntensity: { value: 1 },
+        uColor: { value: new THREE.Color('#9db8ff') },
+        uPortal: this.fx.uPortal,
+      },
+      vertexShader: /* glsl */ `
+        varying vec3 vNormalW;
+        varying vec3 vWorldPos;
+        void main() {
+          vec4 wp = modelMatrix * vec4(position, 1.0);
+          vWorldPos = wp.xyz;
+          vNormalW = normalize(mat3(modelMatrix) * normal);
+          gl_Position = projectionMatrix * viewMatrix * wp;
+        }
+      `,
+      fragmentShader: /* glsl */ `
+        varying vec3 vNormalW;
+        varying vec3 vWorldPos;
+        uniform float uTime;
+        uniform float uIntensity;
+        uniform vec3 uColor;
+        uniform vec3 uPortal;
+        void main() {
+          vec3 viewDir = normalize(cameraPosition - vWorldPos);
+          float edgeSoft = pow(abs(dot(normalize(vNormalW), viewDir)), 1.65);
+          float along = smoothstep(1.95, 0.05, vWorldPos.z - uPortal.z);
+          float camDistFade = smoothstep(0.62, 1.25, length(cameraPosition - uPortal));
+          float scan = 0.92 + 0.08 * sin(vWorldPos.y * 38.0 - uTime * 7.0);
+          gl_FragColor = vec4(uColor, edgeSoft * along * camDistFade * 0.095 * uIntensity * scan);
+        }
+      `,
+    });
+    this.beam = new THREE.Mesh(beamGeo, this.beamMat);
+    this.beam.position.copy(this.screenCenter);
+    G.add(this.beam);
+    // ---------- wall clock (the one that ticks) ----------
     const clock = new THREE.Group();
-    clock.position.set(1.62, 1.98, -hd + 0.02);
-    const cf = new THREE.Mesh(new THREE.CircleGeometry(0.15, 32), this.patch(new THREE.MeshStandardMaterial({ map: clockTexture(), roughness: 0.6 })));
-    clock.add(cf);
-    const rim = new THREE.Mesh(new THREE.TorusGeometry(0.152, 0.012, 8, 32), std('#1c1c1f', 0.4));
-    clock.add(rim);
+    clock.position.set(this.clockPos.x, 2.13, this.clockPos.y);
+    clock.add(new THREE.Mesh(new THREE.CircleGeometry(0.15, 32), this.patch(new THREE.MeshStandardMaterial({ map: clockTexture(), roughness: 0.6 }))));
+    clock.add(new THREE.Mesh(new THREE.TorusGeometry(0.152, 0.012, 8, 32), std('#1c1c1f', 0.4)));
     const handMat = std('#111', 0.5);
     const mkHand = (len: number, w: number, z: number, mat: THREE.Material) => {
       const piv = new THREE.Group();
@@ -483,37 +328,6 @@ export class Room {
     };
     this.hands = [mkHand(0.075, 0.011, 0.004, handMat), mkHand(0.115, 0.007, 0.007, handMat), mkHand(0.125, 0.003, 0.01, std('#b0281e', 0.5))];
     G.add(clock);
-    // ---------- floor clutter ----------
-    const rug = new THREE.Mesh(new THREE.PlaneGeometry(1.9, 1.4, 10, 8), this.patch(new THREE.MeshStandardMaterial({ map: rugTexture(), roughness: 1 })));
-    rug.rotation.x = -Math.PI / 2;
-    rug.rotation.z = 0.12;
-    rug.position.set(0.15, 0.006, 0.35);
-    rug.receiveShadow = true;
-    G.add(rug);
-    cyl(0.13, 0.1, 0.28, this.patch(new THREE.MeshStandardMaterial({ color: '#2a2d33', roughness: 0.6, side: THREE.DoubleSide })), 0.72, 0.14, -2.2, G, true);
-    const paper = std('#d6d2c7', 0.95);
-    for (let i = 0; i < 7; i++) {
-      const p = new THREE.Mesh(new THREE.IcosahedronGeometry(0.035 + rnd() * 0.015, 0), paper);
-      if (i < 3) p.position.set(0.72 + (rnd() - 0.5) * 0.1, 0.2 + rnd() * 0.08, -2.2 + (rnd() - 0.5) * 0.1);
-      else p.position.set(0.55 + rnd() * 0.6, 0.035, -2.0 + rnd() * 0.5);
-      p.rotation.set(rnd() * 3, rnd() * 3, 0);
-      p.castShadow = true;
-      G.add(p);
-    }
-    for (const [x, z, s, col] of [
-      [1.0, -0.55, 0.3, '#3a3f52'],
-      [0.82, -0.3, 0.22, '#5c2f2f'],
-      [0.95, -1.9, 0.26, '#30342f'],
-    ] as [number, number, number, string][]) {
-      const cl = new THREE.Mesh(new THREE.IcosahedronGeometry(1, 1), std(col, 1));
-      cl.scale.set(s, 0.045, s * 0.8);
-      cl.position.set(x, 0.03, z);
-      cl.rotation.y = rnd() * 3;
-      G.add(cl);
-    }
-    const bag = box(0.3, 0.42, 0.16, std('#252a36', 0.9), -0.35, 0.21, hd - 0.12);
-    bag.rotation.x = -0.12;
-    box(0.42, 0.3, 0.32, std('#8a6a48', 0.9), -1.85, 0.15, 2.15);
     // ---------- aftermath shard (hidden at first) ----------
     const shardMat = basic({ color: new THREE.Color(0.25, 0.9, 3.2) });
     const sh = new THREE.Mesh(new THREE.OctahedronGeometry(0.09, 0), shardMat);
@@ -527,15 +341,15 @@ export class Room {
     this.shardLight = new THREE.PointLight('#2a8cff', 0, 2.6, 1.6);
     this.shardLight.position.y = 0.08;
     this.shard.add(this.shardLight);
-    this.shard.position.set(0.25, 0.07, -0.55);
+    this.shard.position.set(-0.78, 0.115, -0.95);
     this.shard.visible = false;
     G.add(this.shard);
     // ---------- lights ----------
-    this.hemi = new THREE.HemisphereLight('#3a4866', '#0e0b09', 0.55);
+    this.hemi = new THREE.HemisphereLight('#3c5a96', '#0b0e18', 0.55);
     G.add(this.hemi);
     this.monitorLight = new THREE.SpotLight('#9db8ff', 9, 9, 1.2, 0.9, 1.4);
     this.monitorLight.position.set(sx, sy, sz + 0.06);
-    this.monitorLight.target.position.set(sx + 0.45, 0.55, 1.2);
+    this.monitorLight.target.position.set(sx + 0.35, 0.55, 1.2);
     this.monitorLight.castShadow = true;
     this.monitorLight.shadow.mapSize.set(1024, 1024);
     this.monitorLight.shadow.bias = -0.0012;
@@ -546,32 +360,41 @@ export class Room {
     this.monitorFill = new THREE.PointLight('#9db8ff', 0.5, 2.4, 1.5);
     this.monitorFill.position.set(sx, 0.98, sz + 0.32);
     G.add(this.monitorFill);
+    // desk lamp (the prop itself is part of the bedroom)
+    const bulb = roomToWorld(-1.74, 1.031, 1.2);
     this.lamp = new THREE.SpotLight('#ffb36b', 6, 3.4, 0.8, 0.7, 1.3);
-    this.lamp.position.set(-0.86, 1.18, -2.2);
-    this.lamp.target.position.set(-0.72, 0.74, -2.02);
+    this.lamp.position.copy(bulb);
+    this.lamp.target.position.set(bulb.x + 0.14, DESK_TOP + 0.02, bulb.z + 0.18);
     G.add(this.lamp, this.lamp.target);
     this.lampGlow = new THREE.PointLight('#ffb36b', 0.45, 3, 1.6);
-    this.lampGlow.position.set(-0.86, 1.05, -2.1);
+    this.lampGlow.position.set(bulb.x + 0.01, bulb.y - 0.06, bulb.z + 0.08);
     G.add(this.lampGlow);
+    // moon through the big window opposite the desk
     this.moon = new THREE.SpotLight('#6f8fd0', 5, 7, 0.55, 1, 1.2);
-    this.moon.position.set(-hw + 0.05, 1.9, -0.9);
-    this.moon.target.position.set(0.3, 0, 0.1);
+    this.moon.position.copy(roomToWorld(2.95, 2.25, -0.55));
+    this.moon.target.position.copy(roomToWorld(1.7, 0.05, -0.55));
     G.add(this.moon, this.moon.target);
-    // ---------- colliders ----------
-    this.chairCollider = { x0: -0.64, x1: -0.08, z0: -1.58, z1: -1.02, on: true };
+    // ---------- colliders (the furniture of the bedroom, turned into this world's axes) ----------
+    this.chairCollider = { ...CHAIR_BOX, on: true };
     this.colliders = [
-      { x0: -1.22, x1: 0.42, z0: -2.5, z1: -1.74, on: true },
+      // bed platform & mattress
+      { x0: -1.716, x1: 1.436, z0: -2.67, z1: -0.8, on: true },
+      // bedside nightstand
+      { x0: 1.436, x1: 2.136, z0: -2.39, z1: -1.69, on: true },
+      // PC desk against the monitor wall
+      { x0: -0.79, x1: 0.81, z0: -2.67, z1: -1.07, on: true },
       this.chairCollider,
-      { x0: 1.1, x1: 2.2, z0: -0.2, z1: 1.95, on: true },
-      { x0: -2.2, x1: -1.85, z0: 0.5, z1: 1.65, on: true },
-      { x0: 0.57, x1: 0.87, z0: -2.36, z1: -2.05, on: true },
+      // window counter / bookshelf / plant
+      { x0: -2.25, x1: 1.62, z0: 1.35, z1: 2.22, on: true },
+      // small storage box under the counter
+      { x0: 1.11, x1: 1.49, z0: -0.83, z1: -0.43, on: true },
     ];
     this.setClock();
   }
   /** keeps the player inside the walls and out of the furniture */
   collide(p: THREE.Vector3, r = 0.27) {
-    p.x = clamp(p.x, -ROOM.hw + r, ROOM.hw - r);
-    p.z = clamp(p.z, -ROOM.hd + r, ROOM.hd - r);
+    p.x = clamp(p.x, WALK.x0 + r, WALK.x1 - r);
+    p.z = clamp(p.z, WALK.z0 + r, WALK.z1 - r);
     for (const b of this.colliders) {
       if (!b.on) continue;
       const cx = clamp(p.x, b.x0, b.x1);
@@ -597,6 +420,10 @@ export class Room {
       }
     }
   }
+  /** height at which something small dropped at (x, z) comes to rest: the desk top or the floor */
+  restY(x: number, z: number) {
+    return x > -0.81 && x < 0.81 && z < -1.08 ? DESK_TOP : FLOOR + 0.004;
+  }
   private setClock() {
     const t = this.clockTime;
     const s = Math.floor(t) % 60;
@@ -605,6 +432,13 @@ export class Room {
     this.hands[0].rotation.z = -(h / 12) * TAU;
     this.hands[1].rotation.z = -(m / 60) * TAU;
     this.hands[2].rotation.z = -(s / 60) * TAU;
+    // the bedside alarm clock agrees with it
+    const minute = Math.floor(t / 60);
+    if (this.bed && minute !== this.lastMinute) {
+      this.lastMinute = minute;
+      const hh = Math.floor(minute / 60) % 24;
+      this.bed.setClock(`${String(hh).padStart(2, '0')}:${String(minute % 60).padStart(2, '0')}`, this.aftermath);
+    }
   }
   setScreenLight(color: THREE.ColorRepresentation, intensity: number) {
     this.monitorLight.color.set(color);
@@ -612,48 +446,44 @@ export class Room {
     this.screenGain = intensity;
   }
   setCeiling(on: boolean) {
-    for (const p of this.ceilingParts) p.visible = on;
+    this.ceilingOn = on;
+    if (!this.bed) return;
+    for (const p of this.bed.ceilingParts) p.visible = on;
+    // from above there is no window to look through either
+    this.bed.exterior.visible = on;
   }
   /** the small things that are different after you come back */
   setAftermath(on: boolean) {
     this.aftermath = on;
     this.shard.visible = on;
     this.shardLight.intensity = on ? 1.4 : 0;
-    (this.poster.material as THREE.MeshStandardMaterial).map = on ? this.posterB : this.posterA;
+    // the painting over the bed, and the night outside
+    this.amb.uAfter.value = on ? 1 : 0;
+    const pose = on ? CHAIR_FALLEN : CHAIR_REST;
+    Object.assign(this.chairCollider, on ? CHAIR_BOX_FALLEN : CHAIR_BOX);
+    if (this.bed) {
+      this.bed.chair.position.fromArray(pose.pos);
+      this.bed.chair.rotation.set(pose.rot[0], pose.rot[1], pose.rot[2]);
+    }
     if (on) {
-      this.chair.position.set(0.62, 0.25, -1.0);
-      this.chair.rotation.set(0, 1.9, Math.PI / 2 - 0.08);
-      this.chairCollider.x0 = 0.3;
-      this.chairCollider.x1 = 1.3;
-      this.chairCollider.z0 = -1.3;
-      this.chairCollider.z1 = -0.75;
-      this.windowMat.color.setRGB(0.25, 0.75, 2.2);
       this.moon.color.set('#2a7cff');
       this.moon.intensity = 7;
     } else {
-      this.chair.position.set(-0.36, 0, -1.3);
-      this.chair.rotation.set(0, 0.32, 0);
-      this.chairCollider.x0 = -0.64;
-      this.chairCollider.x1 = -0.08;
-      this.chairCollider.z0 = -1.58;
-      this.chairCollider.z1 = -1.02;
-      this.windowMat.color.setRGB(0.7, 0.75, 0.9);
       this.moon.color.set('#6f8fd0');
       this.moon.intensity = 5;
       this.clockTime = 2 * 3600 + 47 * 60 + 12;
     }
+    this.lastMinute = -1;
   }
   /** returns true on the frames the second hand moves (for the tick sound) */
-  update(time: number, dt: number, flicker: number): boolean {
-    this.fx.uRfxTime.value = time;
+  update(time: number, dt: number, flicker: number, camera?: THREE.Camera): boolean {
+    const fx = this.fx;
+    fx.uRfxTime.value = time;
     this.clockTime += dt * (this.aftermath ? -1 : 1);
     this.setClock();
     const sec = Math.floor(this.clockTime);
     const ticked = sec !== this.lastSecond;
     this.lastSecond = sec;
-    this.rainTex.offset.y = (time * 0.35) % 1;
-    const pulse = 0.6 + 0.4 * Math.sin(time * 1.3);
-    this.pcLed.color.setRGB(0.2 * pulse, 1.6 * pulse, 2.4 * pulse);
     // lamp: steady, until the corruption starts starving it
     let lampK = this.lampOn;
     if (flicker > 0.01) {
@@ -663,12 +493,28 @@ export class Room {
     }
     this.lamp.intensity = 6 * lampK;
     this.lampGlow.intensity = 0.45 * lampK;
-    this.lampBulb.color.setRGB(3.2 * lampK + 0.02, 2.1 * lampK + 0.015, 1.1 * lampK + 0.01);
     const g = this.screenGain * (0.96 + 0.04 * Math.sin(time * 61));
     this.monitorLight.intensity = 9 * g;
     this.monitorFill.intensity = 0.5 * g;
     this.screenMat.color.setScalar(Math.min(1.9, 1.15 + 0.2 * (g - 1)));
     if (this.aftermath) this.shardLight.intensity = 1.2 + Math.sin(time * 2.1) * 0.35 + fnoise(time * 9, 2) * 0.2;
+    // the bedroom's own ambience follows the same state
+    const spread = clamp(fx.uInfect.value / 2);
+    this.amb.uInfect.value = spread;
+    if (camera) camera.getWorldDirection(this.amb.uCamForward.value);
+    const calm = 1 - clamp(fx.uSuck.value * 3);
+    fx.uRfxRimGain.value = clamp(0.35 + 0.65 * g, 0, 2.2);
+    this.beamMat.uniforms.uColor.value.copy(this.monitorLight.color);
+    this.beamMat.uniforms.uIntensity.value = clamp(g, 0, 2.6) * calm;
+    this.beam.visible = calm > 0.01;
+    if (this.bed) {
+      this.bed.lampBulb.color.setRGB(3.2 * lampK + 0.02, 2.1 * lampK + 0.015, 1.1 * lampK + 0.01);
+      const dust = this.bed.dustMat.uniforms;
+      dust.uPull.value = clamp(fx.uSuck.value * 1.4);
+      dust.uGain.value = clamp(g, 0, 2);
+      dust.uColor.value.copy(this.monitorLight.color).lerp(WHITE, 0.35);
+    }
     return ticked;
   }
 }
+const WHITE = new THREE.Color('#ffffff');

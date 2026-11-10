@@ -100,12 +100,14 @@ export class Engine {
   private frameAvg = 1 / 60;
   private tmp = new THREE.Vector3();
   private disposed = false;
-  constructor(container: HTMLElement, onUI: (s: UIState) => void) {
+  /** false until the bedroom's models and textures have arrived */
+  private ready = false;
+  constructor(container: HTMLElement, onUI: (s: UIState) => void, onFail?: (err: unknown) => void) {
     this.container = container;
     this.onUI = onUI;
     this.ui = {
       phase: 'title',
-      ready: true,
+      ready: false,
       prompt: '',
       hint: '',
       subtitle: '',
@@ -159,20 +161,24 @@ export class Engine {
       this.world.anomaly = 0;
     };
     this.player.pos.set(this.room.startPos.x, 0, this.room.startPos.z);
+    this.player.yaw = this.room.startYaw;
+    this.player.pitch = this.room.startPitch;
     this.camera.position.copy(this.room.startPos);
     this.resize();
-    // warm-up: compile every shader once so no hitch happens mid-experience
-    const hidden: THREE.Object3D[] = [];
-    this.scene.traverse((o) => {
-      if (!o.visible) {
-        hidden.push(o);
-        o.visible = true;
-      }
-    });
-    this.post.render(this.scene, this.camera, 0);
-    hidden.forEach((o) => (o.visible = false));
-    this.showWorld(false);
-    this.showRoom(true);
+    this.warmUp();
+    // the bedroom is made of real files: hold the title screen dark until they are in
+    this.post.params.fade = 1;
+    this.room
+      .load()
+      .then(() => {
+        if (this.disposed) return;
+        this.warmUp();
+        this.ready = true;
+      })
+      .catch((err) => {
+        console.error(err);
+        if (!this.disposed) onFail?.(err);
+      });
     window.addEventListener('resize', this.resize);
     window.addEventListener('keydown', this.onKeyDown);
     window.addEventListener('keyup', this.onKeyUp);
@@ -188,6 +194,27 @@ export class Engine {
     }
     this.last = performance.now();
     this.raf = requestAnimationFrame(this.frame);
+  }
+  /** compile every shader once so no hitch happens mid-experience */
+  private warmUp() {
+    const roomOn = this.room.group.visible;
+    const worldOn = this.world.group.visible;
+    const hidden: THREE.Object3D[] = [];
+    this.scene.traverse((o) => {
+      if (!o.visible) {
+        hidden.push(o);
+        o.visible = true;
+      }
+    });
+    this.post.render(this.scene, this.camera, 0);
+    hidden.forEach((o) => (o.visible = false));
+    if (this.phase === 'title') {
+      this.showWorld(false);
+      this.showRoom(true);
+    } else {
+      this.showWorld(worldOn);
+      this.showRoom(roomOn);
+    }
   }
   dispose() {
     this.disposed = true;
@@ -208,7 +235,7 @@ export class Engine {
   }
   // ------------------------------------------------------------------ public API (UI)
   start() {
-    if (this.phase !== 'title') return;
+    if (this.phase !== 'title' || !this.ready) return;
     this.audio.init();
     this.audio.setRoom(1, 1.5);
     this.requestLock();
@@ -791,8 +818,8 @@ export class Engine {
     this.closeConsole(true);
     this.player.pos.set(this.room.startPos.x, 0, this.room.startPos.z);
     this.player.vel.set(0, 0, 0);
-    this.player.yaw = 0.22;
-    this.player.pitch = -0.04;
+    this.player.yaw = this.room.startYaw;
+    this.player.pitch = this.room.startPitch;
     this.camRoll = 0;
     this.camera.near = 0.04;
     this.camera.far = 400;
@@ -869,7 +896,8 @@ export class Engine {
       case 'title': {
         const s = this.room.startPos;
         this.camera.position.set(s.x + Math.sin(this.time * 0.21) * 0.05, s.y + Math.sin(this.time * 0.33) * 0.015, s.z);
-        this.camera.rotation.set(-0.04 + Math.sin(this.time * 0.27) * 0.01, 0.22 + Math.sin(this.time * 0.17) * 0.03, 0, 'YXZ');
+        this.camera.rotation.set(this.room.startPitch + Math.sin(this.time * 0.27) * 0.01, this.room.startYaw + Math.sin(this.time * 0.17) * 0.03, 0, 'YXZ');
+        if (!this.ready) post.fade = 1;
         break;
       }
       case 'room':
@@ -926,7 +954,7 @@ export class Engine {
     // room
     if (this.room.group.visible) {
       const c = this.bsod.mode === 'bsod' ? this.bsod.corruption : 0;
-      const ticked = this.room.update(this.time, dt, smooth(0.25, 1, c));
+      const ticked = this.room.update(this.time, dt, smooth(0.25, 1, c), this.camera);
       this.bsod.draw(this.time);
       if (this.phase !== 'devour' && this.phase !== 'collapse') {
         const cam = this.camera.position;
@@ -939,10 +967,10 @@ export class Engine {
           const d = Math.hypot(dx, dz) || 1;
           return { pan: clamp(((dx * rx + dz * rz) / d) * 0.85, -1, 1), near: clamp(1.4 / (0.5 + d)) };
         };
-        const fan = pan(-0.95, -2.1);
+        const fan = pan(this.room.fanPos.x, this.room.fanPos.y);
         this.audio.setFan(fan.pan, 0.022 + 0.05 * fan.near * (this.bsod.mode === 'bsod' ? 0.6 : 1));
         if (ticked) {
-          const ck = pan(1.62, -2.48);
+          const ck = pan(this.room.clockPos.x, this.room.clockPos.y);
           this.audio.tick(ck.pan, 0.35 + ck.near * 0.9, Math.floor(this.room.clockTime) % 2 === 0);
         }
       }
@@ -977,7 +1005,7 @@ export class Engine {
     }
     const next: UIState = {
       phase: ph,
-      ready: true,
+      ready: this.ready,
       prompt,
       hint,
       subtitle: this.subtitleT > 0 ? this.subtitleText : '',
