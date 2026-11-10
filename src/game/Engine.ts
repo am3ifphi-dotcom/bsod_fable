@@ -667,6 +667,8 @@ export class Engine {
   }
   private startDevour() {
     this.phase = 'devour';
+    // every night falls into an intact world, including the ones after the first collapse
+    this.world.reset();
     this.bsod.corruption = 1;
     this.bsod.showCursor = false;
     this.subtitleT = 0;
