@@ -314,6 +314,10 @@ export class World {
   sky!: THREE.Mesh;
   rings: THREE.Mesh[] = [];
   core!: THREE.Mesh;
+  /** the four window-frame gates around the plaza (they come down with the tower) */
+  gates: THREE.Group[] = [];
+  /** shared by everything the collapse animates by hand */
+  towerMat: THREE.ShaderMaterial;
   timeScale = 1;
   time = 0;
   anomaly = 0;
@@ -331,7 +335,9 @@ export class World {
   private secretDrawn = -1;
   private secretLocked = -1;
   private nextAnomaly = 16;
-  private towerMat: THREE.ShaderMaterial;
+  private coreBob = 0;
+  /** rest pose of everything the collapse throws around, so a new night starts intact */
+  private home: { obj: THREE.Object3D; pos: THREE.Vector3; rot: THREE.Euler }[] = [];
   constructor() {
     this.u.tText.value = errorTextTexture();
     this.monoMat = new THREE.ShaderMaterial({ vertexShader: MONO_VERT, fragmentShader: MONO_FRAG, uniforms: this.u });
@@ -342,6 +348,9 @@ export class World {
       uniforms: { ...this.u, uCollapseT: { value: 0 } },
     });
     this.build();
+    for (const obj of [this.core, ...this.rings, ...this.gates]) {
+      this.home.push({ obj, pos: obj.position.clone(), rot: obj.rotation.clone() });
+    }
   }
   private build() {
     const G = this.group;
@@ -500,6 +509,7 @@ export class World {
       gate.position.set(Math.sin(a) * 31, terrainHeight(Math.sin(a) * 31, Math.cos(a) * 31) - 0.4, Math.cos(a) * 31);
       gate.rotation.y = a;
       G.add(gate);
+      this.gates.push(gate);
     }
     // ---------- floating error dialogs (classic "stuck window" trails) ----------
     const dlgMat = new THREE.MeshBasicMaterial({ map: dialogTexture(), side: THREE.DoubleSide });
@@ -713,6 +723,11 @@ export class World {
       s.mesh.position.copy(s.pos);
       s.mesh.rotation.copy(s.rot);
     }
+    for (const h of this.home) {
+      h.obj.position.copy(h.pos);
+      h.obj.rotation.copy(h.rot);
+    }
+    this.coreBob = 0;
     this.timeScale = 1;
     this.anomaly = 0;
     this.nextAnomaly = 16;
@@ -735,7 +750,10 @@ export class World {
     this.rings[2].rotation.z += dt * 0.04 * ts;
     this.core.rotation.y += dt * 0.7 * ts;
     this.core.rotation.x += dt * 0.31 * ts;
-    this.core.position.y = 2.9 + Math.sin(t * 0.9) * 0.25;
+    // hover as an offset, so the core can still be dropped by the collapse
+    const bob = Math.sin(t * 0.9) * 0.25;
+    this.core.position.y += bob - this.coreBob;
+    this.coreBob = bob;
     for (let i = 0; i < this.cubes.length; i++) {
       const c = this.cubes[i];
       c.rotation.y += dt * (0.1 + i * 0.03) * ts;

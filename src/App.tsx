@@ -41,6 +41,10 @@ export default function App() {
   const [ui, setUi] = useState<UIState>(INITIAL);
   const [error, setError] = useState('');
   const [reduce, setReduce] = useState(false);
+  // the game needs a keyboard and a mouse; say so up front on touch-only devices
+  const [touchOnly] = useState(
+    () => typeof window !== 'undefined' && window.matchMedia('(hover: none) and (pointer: coarse)').matches
+  );
   useEffect(() => {
     if (!host.current) return;
     let e: Engine;
@@ -185,6 +189,13 @@ export default function App() {
               <Key>M</Key> ミュート
             </span>
           </div>
+          {touchOnly && (
+            <p className="mt-6 border border-white/25 px-4 py-2 text-[11px] leading-6 tracking-[0.18em] text-white/70">
+              この作品はキーボードとマウスで操作します。
+              <br />
+              PCのブラウザでお試しください。
+            </p>
+          )}
           <div className="mt-7 text-[11px] leading-6 tracking-[0.18em] text-white/40">
             ヘッドホン推奨　・　約5分
             <br />※ 激しい点滅・画面の揺れ・大きな音を含みます
